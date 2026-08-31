@@ -4,6 +4,7 @@ Utilities for the GuideLL-M benchmark toolbox module.
 
 from __future__ import annotations
 
+import json as _json
 import re
 import shlex
 from dataclasses import dataclass
@@ -146,6 +147,119 @@ def _build_multi_run_script(*, endpoint_url: str, runs: list[GuideLLMRun]) -> st
     return "\n".join(lines)
 
 
+_RATE_KEY_BY_PROFILE = {
+    "concurrent": "streams",
+    "sweep": "sweep_size",
+    "throughput": "max_concurrency",
+}
+
+
+def _is_guidellm_v07x(image: str) -> bool:
+    """Return True when the image tag indicates GuideLLM >= 0.7.0."""
+    m = re.search(r":v?(\d+)\.(\d+)", image)
+    if not m:
+        return False
+    return (int(m.group(1)), int(m.group(2))) >= (0, 7)
+
+
+def _build_v07x_args(endpoint_url: str, old_args: list[str]) -> list[str]:
+    """Transform v0.6.x CLI args to the v0.7.x ``guidellm run`` format.
+
+    Handles the major CLI refactor shipped in GuideLLM 0.7.0:
+      * ``guidellm benchmark run`` → ``guidellm run``
+      * separate ``--target``, ``--backend-type``, ``--model`` → ``--backend kind=…``
+      * ``--rate-type`` + ``--rate`` → ``--profile kind=…``
+      * ``--max-seconds`` / ``--max-requests`` → ``--constraint kind=…``
+      * ``--output-dir`` + ``--outputs`` → ``--output kind=…``
+    """
+    backend_type = "openai_http"
+    model = None
+    data_spec = None
+    rate_type = "concurrent"
+    rates_str = None
+    max_seconds = None
+    max_requests = None
+    rampup = None
+    passthrough: list[str] = []
+
+    for arg in old_args:
+        key, _, val = arg.partition("=")
+        if key == "--backend-type":
+            backend_type = val
+        elif key == "--rate-type":
+            rate_type = val
+        elif key == "--model":
+            model = val
+        elif key == "--data":
+            data_spec = val
+        elif key == "--rate":
+            rates_str = val
+        elif key == "--max-seconds":
+            max_seconds = val
+        elif key == "--max-requests":
+            max_requests = val
+        elif key == "--rampup":
+            rampup = val
+        elif key in ("--outputs", "--output-dir"):
+            pass
+        else:
+            passthrough.append(arg)
+
+    new_args: list[str] = []
+
+    backend_spec = f"kind={backend_type},target={endpoint_url}"
+    if model:
+        backend_spec += f",model={model}"
+    new_args.append(f"--backend={backend_spec}")
+
+    if data_spec:
+        new_args.append(f"--data=kind=synthetic_text,{data_spec}")
+
+    rate_key = _RATE_KEY_BY_PROFILE.get(rate_type, "rate")
+    if rates_str:
+        rate_values = [v.strip() for v in rates_str.split(",") if v.strip()]
+        if len(rate_values) == 1:
+            profile_spec = f"kind={rate_type},{rate_key}={rate_values[0]}"
+            if rampup:
+                profile_spec += f",rampup_duration={rampup}"
+            new_args.append(f"--profile={profile_spec}")
+        else:
+            profile_dict: dict = {
+                "kind": rate_type,
+                rate_key: [int(r) for r in rate_values],
+            }
+            if rampup:
+                profile_dict["rampup_duration"] = int(rampup)
+            new_args.append(f"--profile={_json.dumps(profile_dict)}")
+    else:
+        new_args.append(f"--profile=kind={rate_type}")
+
+    if max_seconds:
+        new_args.append(f"--constraint=kind=max_duration,seconds={max_seconds}")
+    if max_requests:
+        new_args.append(f"--constraint=kind=max_requests,count={max_requests}")
+
+    new_args.append("--output=kind=json,path=/results/benchmarks.json")
+
+    new_args.extend(passthrough)
+    return new_args
+
+
+def _build_v07x_multi_run_script(
+    *, endpoint_url: str, runs: list[GuideLLMRun]
+) -> str:
+    """Shell script for multiple GuideLLM 0.7.x runs (rate-expression expansion)."""
+    lines = ["set -euo pipefail", "mkdir -p /results"]
+    for run in runs:
+        v07_args = _build_v07x_args(endpoint_url, run.args)
+        output_path = f"/results/benchmarks-{run.label}.json"
+        filtered = [a for a in v07_args if not a.startswith("--output=")]
+        filtered.append(f"--output=kind=json,path={output_path}")
+        command = ["/opt/app-root/bin/guidellm", "run", *filtered]
+        lines.append(shlex.join(command))
+    return "\n".join(lines)
+
+
 def render_guidellm_pvc_from_parts(
     *,
     namespace: str,
@@ -226,18 +340,33 @@ def render_guidellm_job_from_parts(
     manifest = yaml.safe_load(rendered_yaml)
     manifest["spec"]["activeDeadlineSeconds"] = timeout_seconds
     container = manifest["spec"]["template"]["spec"]["containers"][0]
+    v07 = _is_guidellm_v07x(image)
+
     if len(runs) == 1 and runs[0].rate is None:
         container["command"] = ["/opt/app-root/bin/guidellm"]
-        container["args"] = [
-            "benchmark",
-            "run",
-            f"--target={endpoint_url}",
-            *runs[0].args,
-        ]
+        if v07:
+            container["args"] = [
+                "run",
+                *_build_v07x_args(endpoint_url, runs[0].args),
+            ]
+        else:
+            container["args"] = [
+                "benchmark",
+                "run",
+                f"--target={endpoint_url}",
+                *runs[0].args,
+            ]
         return manifest
 
     container["command"] = ["/bin/sh", "-lc"]
-    container["args"] = [_build_multi_run_script(endpoint_url=endpoint_url, runs=runs)]
+    if v07:
+        container["args"] = [
+            _build_v07x_multi_run_script(endpoint_url=endpoint_url, runs=runs)
+        ]
+    else:
+        container["args"] = [
+            _build_multi_run_script(endpoint_url=endpoint_url, runs=runs)
+        ]
     return manifest
 
 
@@ -282,21 +411,27 @@ def render_guidellm_shared_volume_job_from_parts(
     manifest = yaml.safe_load(rendered_yaml)
     manifest["spec"]["activeDeadlineSeconds"] = timeout_seconds
 
-    # Build the main container script
+    v07 = _is_guidellm_v07x(image)
+
     if len(runs) == 1 and runs[0].rate is None:
+        if v07:
+            v07_args = _build_v07x_args(endpoint_url, runs[0].args)
+            cmd = shlex.join(["/opt/app-root/bin/guidellm", "run", *v07_args])
+        else:
+            cmd = f"/opt/app-root/bin/guidellm benchmark run --target={endpoint_url} {' '.join(runs[0].args)}"
         main_script_lines = [
             "set -euo pipefail",
             "mkdir -p /results",
-            f"/opt/app-root/bin/guidellm benchmark run --target={endpoint_url} {' '.join(runs[0].args)}",
+            cmd,
         ]
         main_script = "\n".join(main_script_lines)
-        manifest["spec"]["template"]["spec"]["containers"][0]["command"] = ["/bin/sh", "-c"]
-        manifest["spec"]["template"]["spec"]["containers"][0]["args"] = [main_script]
+    elif v07:
+        main_script = _build_v07x_multi_run_script(endpoint_url=endpoint_url, runs=runs)
     else:
         main_script = _build_multi_run_script(endpoint_url=endpoint_url, runs=runs)
-        manifest["spec"]["template"]["spec"]["containers"][0]["command"] = ["/bin/sh", "-c"]
-        manifest["spec"]["template"]["spec"]["containers"][0]["args"] = [main_script]
 
+    manifest["spec"]["template"]["spec"]["containers"][0]["command"] = ["/bin/sh", "-c"]
+    manifest["spec"]["template"]["spec"]["containers"][0]["args"] = [main_script]
     return manifest
 
 
